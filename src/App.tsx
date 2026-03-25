@@ -384,6 +384,7 @@ export default function App() {
       const material = new THREE.PointsMaterial({
         size: 0.15,
         vertexColors: true,
+        color: new THREE.Color(0.5, 0.5, 0.5), // Decrease brightness
         transparent: true,
         opacity: 1.0,
         blending: THREE.NormalBlending,
