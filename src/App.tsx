@@ -8,50 +8,76 @@ import { BlenderEngine } from './lib/BlenderEngine';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshSurfaceSampler } from 'three/examples/jsm/math/MeshSurfaceSampler.js';
-import { Upload, Settings2, Box, Sparkles, Loader2 } from 'lucide-react';
+import { Upload, Settings2, Box, Sparkles, Loader2, Activity } from 'lucide-react';
 
 export default function App() {
   const panePRef = useRef<HTMLDivElement>(null);
-  const paneMRef = useRef<HTMLDivElement>(null);
   const [engineP, setEngineP] = useState<BlenderEngine | null>(null);
-  const [engineM, setEngineM] = useState<BlenderEngine | null>(null);
   const [sourceScene, setSourceScene] = useState<THREE.Group | null>(null);
   const [particleData, setParticleData] = useState<{ geometry: THREE.BufferGeometry, maxPoints: number } | null>(null);
   const [density, setDensity] = useState(40);
+  const [floatIntensity, setFloatIntensity] = useState(20);
   const [loading, setLoading] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [solidMode, setSolidMode] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const isPausedRef = useRef(isPaused);
+  
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
   
   const transitionUniformsRef = useRef({
     uTransitionY: { value: -10000 },
-    uEdge: { value: 20 }
+    uEdge: { value: 20 },
+    uTime: { value: 0 },
+    uFloatIntensity: { value: 0.002 }
   });
   
+  useEffect(() => {
+    transitionUniformsRef.current.uFloatIntensity.value = floatIntensity / 10000;
+  }, [floatIntensity]);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dropZoneRef = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const MAX_POINTS = 2500000;
 
   useEffect(() => {
-    if (panePRef.current && paneMRef.current) {
+    let animationFrameId: number;
+    const updateTime = () => {
+      transitionUniformsRef.current.uTime.value = performance.now() * 0.001;
+      animationFrameId = requestAnimationFrame(updateTime);
+    };
+    updateTime();
+    return () => cancelAnimationFrame(animationFrameId);
+  }, []);
+
+  useEffect(() => {
+    if (sourceScene && panePRef.current && !engineP) {
       const ep = new BlenderEngine(panePRef.current, true);
-      const em = new BlenderEngine(paneMRef.current, false);
       ep.animate();
-      em.animate();
       setEngineP(ep);
-      setEngineM(em);
 
       const handleResize = () => {
         ep.resize();
-        em.resize();
       };
       window.addEventListener('resize', handleResize);
 
       return () => {
         window.removeEventListener('resize', handleResize);
         ep.dispose();
-        em.dispose();
       };
     }
-  }, []);
+  }, [sourceScene]);
+
+  // Clean up engines when sourceScene is removed
+  useEffect(() => {
+    if (!sourceScene && engineP) {
+        engineP.dispose();
+        setEngineP(null);
+    }
+  }, [sourceScene, engineP]);
 
   useEffect(() => {
     if (!sourceScene) return;
@@ -293,6 +319,20 @@ export default function App() {
         });
       }
 
+      // Shuffle particles uniformly to prevent popping in whole meshes sequentially
+      for (let i = offset - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        for (let k = 0; k < 3; k++) {
+          const tempP = positions[i * 3 + k];
+          positions[i * 3 + k] = positions[j * 3 + k];
+          positions[j * 3 + k] = tempP;
+          
+          const tempC = colors[i * 3 + k];
+          colors[i * 3 + k] = colors[j * 3 + k];
+          colors[j * 3 + k] = tempC;
+        }
+      }
+
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(positions.slice(0, offset * 3), 3));
       geo.setAttribute('color', new THREE.BufferAttribute(colors.slice(0, offset * 3), 3));
@@ -317,12 +357,44 @@ export default function App() {
         newMat.onBeforeCompile = (shader) => {
           shader.uniforms.uTransitionY = transitionUniformsRef.current.uTransitionY;
           shader.uniforms.uEdge = transitionUniformsRef.current.uEdge;
+          shader.uniforms.uTime = transitionUniformsRef.current.uTime;
+          shader.uniforms.uFloatIntensity = transitionUniformsRef.current.uFloatIntensity;
+
+          const vertexUniforms = isSolid ? '' : `
+             uniform float uTime;
+             uniform float uFloatIntensity;
+             // Pseudo-random hash function for independent particle offsets
+             float vHash(vec3 p) {
+                 p = fract(p * 0.3183099 + .1);
+                 p *= 17.0;
+                 return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+             }
+          `;
+          const vertexAnimation = isSolid ? '' : `
+             // Generate unique random phases for each particle based on its position
+             float h1 = vHash(position + vec3(1.0, 0.0, 0.0));
+             float h2 = vHash(position + vec3(0.0, 1.0, 0.0));
+             float h3 = vHash(position + vec3(0.0, 0.0, 1.0));
+             
+             // Extremely subtle micro-floating (noise-like) to stay aligned with original positions
+             transformed.x += sin(uTime * 4.0 + h1 * 6.28) * uFloatIntensity;
+             transformed.y += sin(uTime * 5.0 + h2 * 6.28) * uFloatIntensity;
+             transformed.z += cos(uTime * 4.5 + h3 * 6.28) * uFloatIntensity;
+          `;
 
           shader.vertexShader = shader.vertexShader.replace(
             '#include <common>',
             `#include <common>
-             varying vec3 vWorldPos;`
+             varying vec3 vWorldPos;
+             ${vertexUniforms}`
           );
+          
+          shader.vertexShader = shader.vertexShader.replace(
+            '#include <begin_vertex>',
+            `#include <begin_vertex>
+             ${vertexAnimation}`
+          );
+          
           shader.vertexShader = shader.vertexShader.replace(
             '#include <worldpos_vertex>',
             `#include <worldpos_vertex>
@@ -426,15 +498,15 @@ export default function App() {
       
       if (pointsObj) {
         const minPoints = Math.max(1000, Math.floor(particleData.maxPoints * 0.005));
-        const currentPoints = Math.floor(THREE.MathUtils.mapLinear(density, 1, 100, minPoints, particleData.maxPoints));
+        const normalizedDensity = (density - 1) / 99; // 0.0 to 1.0
+        const easedDensity = Math.pow(normalizedDensity, 2); // Quadratic for smooth start, but more obvious change near 100%
+        const currentPoints = Math.floor(THREE.MathUtils.mapLinear(easedDensity, 0, 1, minPoints, particleData.maxPoints));
         
         pointsObj.geometry.setDrawRange(0, currentPoints);
         
         const mat = pointsObj.material as THREE.PointsMaterial;
-        mat.opacity = THREE.MathUtils.mapLinear(density, 1, 100, 0.6, 1.0);
-        mat.size = THREE.MathUtils.mapLinear(density, 1, 100, 0.3, 0.25);
-        mat.needsUpdate = true;
-
+        mat.size = THREE.MathUtils.mapLinear(easedDensity, 0, 1, 0.3, 0.15); // Adjust size progressively
+        
         if (density < 100 && solidMode) {
           setSolidMode(false);
           if (solidObj) solidObj.visible = false;
@@ -464,39 +536,56 @@ export default function App() {
     box.getSize(size);
     
     const duration = 8000; // Even slower transition (8 seconds)
-    const startTime = performance.now();
+    let accumulatedTime = 0;
+    let lastTime = performance.now();
     const edge = transitionUniformsRef.current.uEdge.value;
     const startY = box.min.y - edge * 0.5;
     const endY = box.max.y + edge * 0.5;
     
     const animateTransition = (time: number) => {
-      const elapsed = time - startTime;
-      const progress = Math.min(elapsed / duration, 1.0);
-      
-      // Smooth step easing
-      const easeProgress = progress < 0.5 
-        ? 4 * progress * progress * progress 
-        : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+      const delta = time - lastTime;
+      lastTime = time;
+
+      if (!isPausedRef.current) {
+        accumulatedTime += delta;
+        const progress = Math.min(accumulatedTime / duration, 1.0);
         
-      const currentY = THREE.MathUtils.lerp(startY, endY, easeProgress);
-      
-      transitionUniformsRef.current.uTransitionY.value = currentY;
-      
-      if (progress < 1.0) {
-        requestAnimationFrame(animateTransition);
-      } else {
-        setIsTransitioning(false);
-        setSolidMode(true);
-        if (pointsObj) pointsObj.visible = false;
-        transitionUniformsRef.current.uTransitionY.value = 10000;
+        // Smooth step easing
+        const easeProgress = progress < 0.5 
+          ? 4 * progress * progress * progress 
+          : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+          
+        const currentY = THREE.MathUtils.lerp(startY, endY, easeProgress);
+        
+        transitionUniformsRef.current.uTransitionY.value = currentY;
+        
+        if (progress >= 1.0) {
+          setIsTransitioning(false);
+          setSolidMode(true);
+          setIsPaused(false);
+          if (pointsObj) pointsObj.visible = false;
+          transitionUniformsRef.current.uTransitionY.value = 10000;
+          return;
+        }
       }
+      
+      requestAnimationFrame(animateTransition);
     };
     
     requestAnimationFrame(animateTransition);
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement> | React.DragEvent<HTMLDivElement>, isDrop = false) => {
+    let file: File | undefined;
+    if (isDrop) {
+      const dropEvent = e as React.DragEvent<HTMLDivElement>;
+      dropEvent.preventDefault();
+      setIsDragging(false);
+      file = dropEvent.dataTransfer.files?.[0];
+    } else {
+      file = (e as React.ChangeEvent<HTMLInputElement>).target.files?.[0];
+    }
+    
     if (!file) return;
 
     setLoading(true);
@@ -504,13 +593,148 @@ export default function App() {
 
     new GLTFLoader().load(url, (gltf) => {
       setSourceScene(gltf.scene);
-      engineM?.setModel(gltf.scene);
+      setDensity(40);
+      setIsTransitioning(false);
+      setSolidMode(false);
       setLoading(false);
     }, undefined, (error) => {
       console.error(error);
       setLoading(false);
     });
   };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const resetModel = () => {
+    setSourceScene(null);
+    setParticleData(null);
+    setDensity(40);
+  };
+
+  const dematerialize = () => {
+    if (!engineP) return;
+    setIsTransitioning(true);
+    
+    const pointsObj = engineP.modelGroup.getObjectByName('particleModel') as THREE.Points;
+    const solidObj = engineP.modelGroup.getObjectByName('solidModel');
+    
+    if (pointsObj) pointsObj.visible = true;
+    
+    const box = new THREE.Box3().setFromObject(engineP.modelGroup);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    
+    const duration = 6000;
+    let accumulatedTime = 0;
+    let lastTime = performance.now();
+    const edge = transitionUniformsRef.current.uEdge.value;
+    const endY = box.min.y - edge * 0.5;
+    const startY = box.max.y + edge * 0.5;
+    
+    transitionUniformsRef.current.uTransitionY.value = startY;
+    
+    const animateTransition = (time: number) => {
+      const delta = time - lastTime;
+      lastTime = time;
+
+      if (!isPausedRef.current) {
+        accumulatedTime += delta;
+        const progress = Math.min(accumulatedTime / duration, 1.0);
+        
+        const easeProgress = progress < 0.5 
+          ? 4 * progress * progress * progress 
+          : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+          
+        const currentY = THREE.MathUtils.lerp(startY, endY, easeProgress);
+        
+        transitionUniformsRef.current.uTransitionY.value = currentY;
+        
+        if (progress >= 1.0) {
+          setIsTransitioning(false);
+          setSolidMode(false);
+          setIsPaused(false);
+          if (solidObj) solidObj.visible = false;
+          transitionUniformsRef.current.uTransitionY.value = -10000;
+          setDensity(100);
+          return;
+        }
+      }
+      
+      requestAnimationFrame(animateTransition);
+    };
+    
+    requestAnimationFrame(animateTransition);
+  };
+
+  if (!sourceScene) {
+    return (
+      <div 
+        className={`w-full h-screen overflow-hidden bg-black text-white font-sans selection:bg-cyan-500/30 flex items-center justify-center transition-colors duration-500 ${isDragging ? 'bg-cyan-950/20' : ''}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={(e) => handleFileUpload(e, true)}
+      >
+        <div className="absolute top-8 left-8 flex items-center gap-3">
+          <div className="w-10 h-10 rounded bg-cyan-500/10 border border-cyan-500/50 flex items-center justify-center">
+            <Box className="w-5 h-5 text-cyan-400" />
+          </div>
+          <div className="font-black tracking-[0.2em] text-cyan-50 text-base">
+            粒子重构系统
+          </div>
+        </div>
+
+        <div className="max-w-xl w-full p-12 border border-cyan-500/20 bg-black/40 backdrop-blur-md rounded-2xl flex flex-col items-center justify-center gap-8 relative overflow-hidden group">
+          <div className="absolute inset-0 bg-cyan-400/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+          <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/20 blur-[100px] rounded-full pointer-events-none" />
+          <div className="absolute bottom-0 left-0 w-32 h-32 bg-purple-500/20 blur-[100px] rounded-full pointer-events-none" />
+          
+          <div className={`w-24 h-24 rounded-full border border-cyan-500/30 flex items-center justify-center mb-4 transition-all duration-500 ${isDragging ? 'bg-cyan-500/20 scale-110' : 'bg-transparent'}`}>
+            <Upload className={`w-10 h-10 ${isDragging ? 'text-cyan-300' : 'text-cyan-500'}`} />
+          </div>
+          
+          <div className="text-center space-y-4">
+            <h1 className="text-2xl font-bold tracking-[0.1em] text-cyan-50">初始化几何体</h1>
+            <p className="text-cyan-400/60 font-medium">将 3D 模型拖拽至此处 (.gltf 或 .glb)</p>
+          </div>
+          
+          <button 
+            onClick={() => fileInputRef.current?.click()}
+            className="group relative px-8 py-4 bg-transparent border border-cyan-500 text-cyan-400 text-sm font-bold uppercase tracking-wider transition-all duration-300 hover:bg-cyan-500 hover:text-black hover:shadow-[0_0_30px_rgba(0,242,255,0.4)] flex items-center gap-3 overflow-hidden"
+          >
+            <div className="absolute inset-0 bg-cyan-400/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
+            <span className="relative z-10">选择文件</span>
+          </button>
+          
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            accept=".glb,.gltf" 
+            onChange={(e) => handleFileUpload(e, false)}
+            className="hidden" 
+          />
+        </div>
+
+        {loading && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[2000] flex flex-col items-center justify-center text-cyan-400 gap-6">
+            <div className="relative flex items-center justify-center">
+              <div className="absolute w-24 h-24 border-t-2 border-l-2 border-cyan-500 rounded-full animate-[spin_3s_linear_infinite]" />
+              <div className="absolute w-16 h-16 border-r-2 border-b-2 border-cyan-300 rounded-full animate-[spin_2s_linear_infinite_reverse]" />
+              <Box className="w-6 h-6 animate-pulse" />
+            </div>
+            <div className="text-sm tracking-[0.4em] font-bold animate-pulse">正在提取粒子...</div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="w-full h-screen overflow-hidden bg-black text-white font-sans selection:bg-cyan-500/30">
@@ -521,7 +745,7 @@ export default function App() {
             <Box className="w-4 h-4 text-cyan-400" />
           </div>
           <div className="font-black tracking-[0.2em] text-cyan-50 text-sm">
-            SYSTEM_V6
+            粒子重构系统
           </div>
         </div>
         
@@ -529,7 +753,7 @@ export default function App() {
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-xs text-cyan-400 font-medium uppercase tracking-wider">
               <Settings2 className="w-4 h-4" />
-              <span>Particle Density</span>
+              <span>粒子密度</span>
             </div>
             <input 
               type="range" 
@@ -537,95 +761,115 @@ export default function App() {
               max="100" 
               value={density}
               onChange={(e) => setDensity(Number(e.target.value))}
-              className="w-32 accent-cyan-400 cursor-pointer" 
+              disabled={solidMode || isTransitioning}
+              className={`w-32 accent-cyan-400 cursor-pointer ${solidMode || isTransitioning ? 'opacity-50 grayscale' : ''}`} 
             />
-            <span className="text-xs text-cyan-400 w-6 text-right font-mono">{density}%</span>
+            <span className="text-xs text-cyan-400 w-10 text-right font-mono">{density}%</span>
           </div>
           
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 text-xs text-purple-400 font-medium uppercase tracking-wider">
+              <Activity className="w-4 h-4" />
+              <span>浮动程度</span>
+            </div>
+            <input 
+              type="range" 
+              min="0" 
+              max="100" 
+              value={floatIntensity}
+              onChange={(e) => setFloatIntensity(Number(e.target.value))}
+              disabled={solidMode || isTransitioning}
+              className={`w-32 accent-purple-400 cursor-pointer ${solidMode || isTransitioning ? 'opacity-50 grayscale' : ''}`} 
+            />
+            <span className="text-xs text-purple-400 w-10 text-right font-mono">{floatIntensity}%</span>
+          </div>
+
           <button 
-            onClick={() => fileInputRef.current?.click()}
-            className="group relative px-5 py-2 bg-transparent border border-cyan-500 text-cyan-400 text-xs font-bold uppercase tracking-wider transition-all duration-300 hover:bg-cyan-500 hover:text-black hover:shadow-[0_0_20px_rgba(0,242,255,0.5)] flex items-center gap-2 overflow-hidden"
+            onClick={resetModel}
+            disabled={isTransitioning}
+            className={`px-5 py-2 text-red-400/80 hover:text-red-400 text-xs font-bold uppercase tracking-wider transition-all duration-300 ${isTransitioning ? 'opacity-50 cursor-not-allowed' : 'hover:bg-red-500/10 border border-transparent hover:border-red-500/30'}`}
           >
-            <div className="absolute inset-0 bg-cyan-400/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
-            <Upload className="w-4 h-4 relative z-10" />
-            <span className="relative z-10">Load 3D Model</span>
+            重新上传
           </button>
-          <input 
-            type="file" 
-            ref={fileInputRef} 
-            accept=".glb,.gltf" 
-            onChange={handleFileUpload}
-            className="hidden" 
-          />
         </div>
       </div>
 
       {/* Loading Overlay */}
       {loading && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[2000] flex flex-col items-center justify-center text-cyan-400 gap-4">
-          <Loader2 className="w-12 h-12 animate-spin" />
-          <div className="text-lg tracking-[0.3em] font-light animate-pulse">DECODING GEOMETRY...</div>
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[2000] flex flex-col items-center justify-center text-cyan-400 gap-6">
+          <div className="relative flex items-center justify-center">
+            <div className="absolute w-24 h-24 border-t-2 border-l-2 border-cyan-500 rounded-full animate-[spin_3s_linear_infinite]" />
+            <div className="absolute w-16 h-16 border-r-2 border-b-2 border-cyan-300 rounded-full animate-[spin_2s_linear_infinite_reverse]" />
+            <Box className="w-6 h-6 animate-pulse" />
+          </div>
+          <div className="text-sm tracking-[0.4em] font-bold animate-pulse">正在重建...</div>
         </div>
       )}
 
       {/* View Container */}
-      <div className="flex w-full h-full pt-16">
+      <div className="flex w-full h-full pt-16 relative">
         {/* Particle Pane */}
-        <div className="flex-1 relative border-r border-cyan-500/20 group">
+        <div className="flex-1 relative group bg-black/50">
           <div className="absolute top-6 left-6 z-10 pointer-events-none">
             <div className="flex items-center gap-2 text-[10px] text-cyan-400 tracking-[0.2em] uppercase font-bold opacity-70 group-hover:opacity-100 transition-opacity">
               <Sparkles className="w-3 h-3" />
-              <span>Particle Reconstruction Field</span>
+              <span>粒子重构场</span>
             </div>
             <div className="w-8 h-[2px] bg-cyan-500 mt-2 opacity-50" />
           </div>
           <div ref={panePRef} className="w-full h-full" />
           
-          {/* Decorative corners */}
           <div className="absolute top-0 left-0 w-4 h-4 border-t border-l border-cyan-500/30 m-4 pointer-events-none" />
+          <div className="absolute top-0 right-0 w-4 h-4 border-t border-r border-cyan-500/30 m-4 pointer-events-none" />
           <div className="absolute bottom-0 right-0 w-4 h-4 border-b border-r border-cyan-500/30 m-4 pointer-events-none" />
+          <div className="absolute bottom-0 left-0 w-4 h-4 border-b border-l border-cyan-500/30 m-4 pointer-events-none" />
+        </div>
 
-          {/* Transition Button */}
+        {/* Floating action bar for states */}
+        <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20 flex gap-4 pointer-events-none">
           {density === 100 && !solidMode && !isTransitioning && particleData && (
-            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20">
+            <button
+              onClick={startTransition}
+              className="pointer-events-auto group relative px-6 py-3 bg-black/80 backdrop-blur-md border border-cyan-500 text-cyan-400 text-xs font-bold uppercase tracking-[0.2em] transition-all duration-300 hover:bg-cyan-500 hover:text-black hover:shadow-[0_0_30px_rgba(0,242,255,0.6)] flex items-center gap-3 overflow-hidden rounded-sm"
+            >
+              <div className="absolute inset-0 bg-cyan-400/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
+              <Sparkles className="w-4 h-4 relative z-10 animate-pulse" />
+              <span className="relative z-10">实体化</span>
+            </button>
+          )}
+
+          {isTransitioning && (
+            <div className="flex gap-4 pointer-events-auto">
+              <div className="px-6 py-3 bg-black/80 backdrop-blur-md border border-cyan-500/50 text-cyan-400/80 text-xs font-bold uppercase tracking-[0.2em] rounded-sm flex items-center gap-3">
+                <Loader2 className={`w-4 h-4 ${isPaused ? '' : 'animate-spin'}`} />
+                <span>{isPaused ? '已暂停...' : '处理中...'}</span>
+              </div>
               <button
-                onClick={startTransition}
-                className="group relative px-6 py-3 bg-black/80 backdrop-blur-md border border-cyan-500 text-cyan-400 text-xs font-bold uppercase tracking-[0.2em] transition-all duration-300 hover:bg-cyan-500 hover:text-black hover:shadow-[0_0_30px_rgba(0,242,255,0.6)] flex items-center gap-3 overflow-hidden rounded-sm"
+                onClick={() => setIsPaused(!isPaused)}
+                className={`px-6 py-3 bg-black/80 backdrop-blur-md border ${isPaused ? 'border-amber-500 text-amber-400 hover:bg-amber-500/20' : 'border-cyan-500 text-cyan-400 hover:bg-cyan-500/20'} text-xs font-bold uppercase tracking-[0.2em] transition-all duration-300 flex items-center gap-3 overflow-hidden rounded-sm`}
               >
-                <div className="absolute inset-0 bg-cyan-400/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
-                <Sparkles className="w-4 h-4 relative z-10 animate-pulse" />
-                <span className="relative z-10">Materialize Solid</span>
+                <span>{isPaused ? '恢复' : '暂停'}</span>
               </button>
             </div>
           )}
-          {isTransitioning && (
-            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20 px-6 py-3 bg-black/80 backdrop-blur-md border border-cyan-500/50 text-cyan-400/80 text-xs font-bold uppercase tracking-[0.2em] rounded-sm flex items-center gap-3">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>Materializing...</span>
-            </div>
-          )}
-          {solidMode && (
-            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20 px-6 py-3 bg-emerald-950/80 backdrop-blur-md border border-emerald-500/50 text-emerald-400 text-xs font-bold uppercase tracking-[0.2em] rounded-sm flex items-center gap-3 shadow-[0_0_20px_rgba(16,185,129,0.2)]">
-              <Box className="w-4 h-4" />
-              <span>Solid Material Active</span>
-            </div>
-          )}
-        </div>
 
-        {/* Mesh Pane */}
-        <div className="flex-1 relative group bg-black/50">
-          <div className="absolute top-6 left-6 z-10 pointer-events-none">
-            <div className="flex items-center gap-2 text-[10px] text-cyan-400 tracking-[0.2em] uppercase font-bold opacity-70 group-hover:opacity-100 transition-opacity">
-              <Box className="w-3 h-3" />
-              <span>Original Material Mesh</span>
+          {solidMode && !isTransitioning && (
+            <div className="flex gap-4 pointer-events-auto">
+              <div className="px-6 py-3 bg-emerald-950/80 backdrop-blur-md border border-emerald-500/50 text-emerald-400 text-xs font-bold uppercase tracking-[0.2em] rounded-sm flex items-center gap-3 shadow-[0_0_20px_rgba(16,185,129,0.2)]">
+                <Box className="w-4 h-4" />
+                <span>实体模型已激活</span>
+              </div>
+              
+              <button
+                onClick={dematerialize}
+                className="group relative px-6 py-3 bg-black/80 backdrop-blur-md border border-purple-500 text-purple-400 text-xs font-bold uppercase tracking-[0.2em] transition-all duration-300 hover:bg-purple-500 hover:text-black hover:shadow-[0_0_30px_rgba(168,85,247,0.4)] flex items-center gap-3 overflow-hidden rounded-sm"
+              >
+                <div className="absolute inset-0 bg-purple-400/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
+                <Sparkles className="w-4 h-4 relative z-10" />
+                <span className="relative z-10">恢复粒子效果</span>
+              </button>
             </div>
-            <div className="w-8 h-[2px] bg-cyan-500 mt-2 opacity-50" />
-          </div>
-          <div ref={paneMRef} className="w-full h-full" />
-          
-          {/* Decorative corners */}
-          <div className="absolute top-0 right-0 w-4 h-4 border-t border-r border-cyan-500/30 m-4 pointer-events-none" />
-          <div className="absolute bottom-0 left-0 w-4 h-4 border-b border-l border-cyan-500/30 m-4 pointer-events-none" />
+          )}
         </div>
       </div>
     </div>
